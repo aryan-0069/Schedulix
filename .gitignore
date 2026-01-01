@@ -1,0 +1,29 @@
+# Executables and binaries
+*.exe
+*.out
+*.app
+*.bin
+scheduler_sim
+scheduler_real
+validator
+run_tests
+scheduler
+
+# Object files and libraries
+*.o
+*.obj
+*.so
+*.dylib
+*.a
+
+# Debugging and IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+build/
+
+# Temp files
+*.tmp
+*.log
