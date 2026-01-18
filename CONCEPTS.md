@@ -201,3 +201,125 @@ Avg WT = (0 + 0 + 2) / 3 = 0.67  ← much better
 
 ---
 
+## 5. Algorithm 2 — SJF
+
+### Definition
+**Shortest Job First** — among all ready processes, pick the one with the smallest remaining burst time. Non-preemptive: once started, a process runs to completion.
+
+### Implementation
+
+```
+Use a min-heap ordered by (burst, arrival, id) for tie-breaking.
+current_time = first_arrival
+
+Loop until all done:
+    Admit all processes with arrival <= current_time to heap
+    If heap empty: jump to next arrival
+    Pop (bt, at, id) from heap
+    Run [current_time, current_time + bt]
+    current_time += bt
+```
+
+### Why it minimizes average WT (proof sketch)
+
+Suppose we have two processes with burst times b₁ < b₂. If we run b₂ first:
+- Total WT = 0 + b₂ = b₂
+
+If we run b₁ first:
+- Total WT = 0 + b₁ = b₁
+
+Since b₁ < b₂, running shorter jobs first reduces total waiting time. This generalises by induction to n processes — SJF is **optimal for non-preemptive average WT**.
+
+### The Oracle Problem
+
+SJF requires knowing burst times in advance. Real systems don't have this.
+
+**Exponential averaging** approximates next burst:
+```
+τ_(n+1) = α · t_n + (1 − α) · τ_n
+```
+where `t_n` = actual nth burst, `τ_n` = predicted nth burst, `α ∈ (0,1)`.
+
+With α=0.5, recent bursts are weighted more. This is what real Linux batch schedulers use.
+
+---
+
+## 6. Algorithm 3 — SRTF
+
+### Definition
+**Shortest Remaining Time First** — preemptive version of SJF. At any arrival, if the new process's burst is shorter than the remaining time of the running process, preempt.
+
+### Implementation
+
+```
+Use a min-heap ordered by (remaining_time, id).
+current_time = first_arrival
+
+Loop until all done:
+    Admit all arrived processes to heap
+    If heap empty: jump to next arrival
+    next_arrival = next unadmitted process arrival (or INF)
+    Pop (remaining, id)
+    run = min(remaining, next_arrival − current_time)
+    Execute [current_time, current_time + run]
+    current_time += run
+    Update remaining[id] -= run
+    If remaining > 0: push back to heap
+```
+
+### Why SRTF is globally optimal
+
+SRTF is the **preemptive optimal** algorithm for minimizing average waiting time. Proof: at every moment, running the job with least remaining time is the greedy choice that minimizes future waiting. Any deviation would increase total waiting.
+
+### Trade-off
+
+SRTF has the highest context-switch overhead (potentially O(n²) switches in the worst case). The more arrivals and preemptions, the more overhead.
+
+---
+
+## 7. Algorithm 4 — Round Robin
+
+### Definition
+**Round Robin** — processes are served in FIFO order from a circular queue; each process runs for at most `quantum` time units before being preempted and placed at the back.
+
+### Implementation
+
+```
+Sort by arrival. Initialize ready queue with first arrivals.
+Loop until ready queue empty:
+    i = dequeue front
+    run = min(quantum, remaining[i])
+    Execute [current_time, current_time + run]
+    current_time += run
+    remaining[i] -= run
+    Admit all processes with arrival <= current_time
+    If remaining[i] > 0: enqueue i at back
+    If queue empty and more to arrive: advance time
+```
+
+### Critical implementation detail: admission timing
+
+Newly arrived processes should be admitted **after** the currently running slice completes but **before** the preempted process re-enters the queue. This matches hardware behavior — the arriving process is ready before the preempted one gets re-queued.
+
+```
+Wrong order:
+  re-enqueue preempted process → admit new arrivals
+  (new arrivals go after the preempted process)
+
+Correct order:
+  admit new arrivals → re-enqueue preempted process
+  (new arrivals go before the preempted process if they arrived during the slice)
+```
+
+### Quantum choice
+
+Let `q` = quantum, `n` = number of processes, `σ` = context switch overhead:
+
+- **Response time** ≤ (n−1)·q + σ  (bounded!)
+- **Turnaround** ≈ burst + (burst/q)·(context switches)
+- Rule of thumb: q should be larger than 80% of CPU bursts (i.e., most jobs finish in one quantum)
+
+Modern Linux uses a default quantum of ~4 ms for interactive processes.
+
+---
+
