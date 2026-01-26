@@ -323,3 +323,83 @@ Modern Linux uses a default quantum of ~4 ms for interactive processes.
 
 ---
 
+## 8. Algorithm 5 — MLFQ
+
+### Motivation
+
+Neither RR nor SJF is ideal:
+- RR treats all processes equally (ignores actual behavior)
+- SJF requires advance knowledge of burst time
+
+MLFQ learns about processes over time: interactive/short processes naturally stay at high priority; long CPU-bound processes get demoted.
+
+### Structure
+
+```
+Queue 0: highest priority, smallest quantum Q₀
+Queue 1: medium priority,  quantum Q₁ = 2·Q₀
+Queue 2: lowest priority,  FCFS (infinite quantum)
+...
+Queue k: lowest priority
+```
+
+### The Five Rules (Ousterhout)
+
+**Rule 1**: If Priority(A) > Priority(B) → A runs.
+
+**Rule 2**: If Priority(A) = Priority(B) → A and B run in Round Robin.
+
+**Rule 3**: When a job enters the system, it starts at the highest priority (top queue).
+
+**Rule 4**: Once a job uses up its time allotment at a given level (regardless of how many times it has given up the CPU), its priority is reduced (moved down one queue).
+- **Old Rule 4a** (naive): If a job gives up the CPU voluntarily, stay at same priority.
+- **Old Rule 4b** (naive): If a job uses entire quantum, demote.
+- **Problem**: A process could game the scheduler by yielding just before quantum expires!
+- **New Rule 4** (fixed): Track *total* CPU time at the current level; demote when total allotment exhausted.
+
+**Rule 5 (Priority Boost)**: After every period S, move all jobs to the topmost queue.
+- Prevents starvation: long jobs that have been demoted get a fresh start
+- Prevents priority inversion: a CPU-bound job that suddenly becomes interactive gets promoted
+
+### Allotment vs Quantum
+
+- **Quantum**: Time per individual slice at a level
+- **Allotment**: Total time budget at a level before demotion
+
+A job can have multiple slices at a level if it voluntarily yields; it demotes only when the allotment is exhausted.
+
+### Worked Example
+
+```
+Q=5 ticks, Levels: L0(allot=5), L1(allot=10), L2(FCFS)
+Boost every 50 ticks.
+
+Process A: AT=0, BT=50 (long CPU-bound)
+Process B: AT=15, BT=5  (short interactive)
+
+t=0:   A enters L0
+t=0-5: A runs at L0 (allotment exhausted) → demotes to L1
+t=5-15: A runs at L1 (uses 10ms allotment) → demotes to L2
+t=15:  B enters L0 (higher priority than A at L2)
+t=15-20: B runs at L0 (completes in 5ms, stays at L0)
+t=20:  A resumes at L2 (FCFS)
+t=20-55: A completes
+
+B: TAT=5, WT=0 ← interactive process barely waited!
+A: TAT=55, WT=5 ← long process waited for B
+```
+
+### Anti-gaming
+
+Without "gaming prevention", a malicious process could do:
+```
+while running:
+    do 99% of quantum worth of work
+    yield    ← stays at L0!
+    // never demoted despite being CPU-bound
+```
+
+The allotment fix: track cumulative CPU time at the level. The above example burns through the L0 allotment in one slice — same demotion speed.
+
+---
+
