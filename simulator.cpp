@@ -346,3 +346,212 @@ std::vector<Segment> mlfq(const std::vector<Task>& tasks,
     return tl;
 }
 
+// ============================================================================
+//  CFS — Completely Fair Scheduler
+//
+//  Core ideas:
+//    - Each task tracks `vruntime` = sum of (real_time * WEIGHT_NICE0 / weight_i)
+//    - Scheduler always picks the task with the smallest vruntime (most "behind").
+//    - Slice size = (target_latency * weight_i) / total_weight  [clamped to min_gran]
+//    - On wakeup, vruntime is set to max(current_vruntime, min_vruntime - target_latency)
+//      so sleeping tasks don't hoard time-share.
+//    - min_vruntime monotonically increases (the "floor" of the runqueue).
+// ============================================================================
+
+std::vector<Segment> cfs(const std::vector<Task>& tasks,
+                          double target_latency   = CFS_TARGET_LATENCY,
+                          double min_granularity  = CFS_MIN_GRANULARITY)
+{
+    if (tasks.empty()) return {};
+
+    // --- Runqueue entry ---
+    struct RQEntry {
+        double vruntime;
+        int    pi; // index into sorted_tasks
+        bool operator<(const RQEntry& o) const {
+            if (vruntime != o.vruntime) return vruntime < o.vruntime;
+            return pi < o.pi;
+        }
+    };
+
+    // Per-task state
+    struct TState {
+        int    remaining;
+        int    weight;
+        double vruntime;
+        bool   in_rq;
+        bool   done;
+    };
+
+    const int n = static_cast<int>(tasks.size());
+    std::vector<Task> sorted_tasks = tasks;
+    std::sort(sorted_tasks.begin(), sorted_tasks.end(), [](const Task& a, const Task& b){
+        return a.arrival < b.arrival || (a.arrival == b.arrival && a.id < b.id);
+    });
+
+    std::vector<TState> state(n);
+    for (int i = 0; i < n; i++) {
+        state[i] = {sorted_tasks[i].burst, sorted_tasks[i].weight(), 0.0, false, false};
+    }
+
+    std::set<RQEntry> rq; // ordered by vruntime
+    double min_vrt = 0.0; // global minimum vruntime
+    std::vector<Segment> tl;
+    double cur = sorted_tasks[0].arrival;
+    int idx = 0;
+
+    // Total weight of processes in the runqueue
+    auto total_weight = [&]() {
+        int tw = 0;
+        for (const auto& e : rq) {
+            tw += state[e.pi].weight;
+        }
+        return tw == 0 ? 1 : tw;
+    };
+
+    // Admit processes that have arrived by time t
+    auto admit = [&](double t) {
+        while (idx < n && sorted_tasks[idx].arrival <= t) {
+            int pi = idx;
+            // Set vruntime: new process inherits min_vruntime (minus one target_latency
+            // so it gets to run soon, but doesn't immediately starve others)
+            double vrt = std::max(0.0, min_vrt - target_latency);
+            state[pi].vruntime = vrt;
+            state[pi].in_rq    = true;
+            rq.insert({vrt, pi});
+            idx++;
+        }
+    };
+
+    admit(cur);
+
+    while (true) {
+        if (rq.empty()) {
+            if (idx < n) {
+                cur = sorted_tasks[idx].arrival;
+                admit(cur);
+                continue;
+            }
+            break;
+        }
+
+        // Pick the task with smallest vruntime
+        auto it = rq.begin();
+        int pi = it->pi;
+        int tw = total_weight(); // runnable total weight including pi
+        rq.erase(it);
+
+        int w  = state[pi].weight;
+
+        // Compute slice: (target_latency * w) / total_runnable_weight
+        double slice = (target_latency * w) / tw;
+        if (slice < min_granularity) slice = min_granularity;
+
+        // Clamp to remaining work
+        double actual = std::min(slice, static_cast<double>(state[pi].remaining));
+
+        // Check for next arrival preemption
+        double next_arr = (idx < n) ? static_cast<double>(sorted_tasks[idx].arrival) : INF_TIME;
+        if (next_arr < cur + actual) {
+            // Preempt at next arrival (re-evaluate then)
+            actual = next_arr - cur;
+            if (actual <= 0) {
+                // Admit the new process then re-pick
+                admit(cur);
+                rq.insert({state[pi].vruntime, pi});
+                continue;
+            }
+        }
+
+        tl.push_back({sorted_tasks[pi].id, cur, cur + actual});
+        double delta_vrt = actual * static_cast<double>(WEIGHT_NICE0) / w;
+        state[pi].vruntime  += delta_vrt;
+        state[pi].remaining -= static_cast<int>(actual);
+        cur += actual;
+
+        // Update min_vruntime (monotonically)
+        if (!rq.empty()) {
+            min_vrt = std::max(min_vrt, rq.begin()->vruntime);
+        }
+        min_vrt = std::max(min_vrt, state[pi].vruntime - target_latency);
+
+        admit(cur);
+
+        if (state[pi].remaining > 0) {
+            state[pi].in_rq = true;
+            rq.insert({state[pi].vruntime, pi});
+        } else {
+            state[pi].done = true;
+        }
+    }
+    return tl;
+}
+
+// ============================================================================
+//  Main — Interactive mode: run all algorithms and compare
+// ============================================================================
+
+static std::vector<Task> readTasks() {
+    int n;
+    std::cout << "Number of processes: ";
+    std::cin >> n;
+    if (n <= 0) throw std::invalid_argument("process count must be > 0");
+
+    std::vector<Task> tasks(n);
+    std::cout << "Enter (arrival_time  burst_time  nice_value[-20..19])"
+                 "  for each process (nice=0 for default):\n";
+    for (int i = 0; i < n; i++) {
+        tasks[i].id = i;
+        std::cout << "  P" << i << ": ";
+        std::cin >> tasks[i].arrival >> tasks[i].burst >> tasks[i].nice;
+        if (tasks[i].arrival < 0 || tasks[i].burst <= 0)
+            throw std::invalid_argument("arrival>=0 and burst>0 required");
+    }
+    return tasks;
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    std::cout << "╔══════════════════════════════════════════════════╗\n";
+    std::cout << "║       OS Scheduler — Simulation Engine           ║\n";
+    std::cout << "║  Algorithms: FCFS | SJF | SRTF | RR | MLFQ | CFS║\n";
+    std::cout << "╚══════════════════════════════════════════════════╝\n\n";
+
+    try {
+        auto tasks = readTasks();
+
+        int quantum;
+        std::cout << "Time quantum for RR/MLFQ (default=" << DEFAULT_QUANTUM << "): ";
+        std::cin >> quantum;
+        if (quantum <= 0) quantum = DEFAULT_QUANTUM;
+
+        std::vector<RunSummary> summaries;
+
+        auto run = [&](const std::string& name, const std::vector<Segment>& tl) {
+            auto res = buildResults(tasks, tl);
+            std::cout << "\n[ " << name << " ]\n";
+            printResultsTable(res);
+            printGantt(tl);
+            auto s = buildSummary(name, tl, res);
+            summaries.push_back(s);
+        };
+
+        run("FCFS",                  fcfs(tasks));
+        run("SJF",                   sjf(tasks));
+        run("SRTF",                  srtf(tasks));
+        run("RR(q="+std::to_string(quantum)+")",
+                                     roundRobin(tasks, quantum));
+        run("MLFQ(q="+std::to_string(quantum)+")",
+                                     mlfq(tasks, quantum));
+        run("CFS",                   cfs(tasks));
+
+        printComparison(summaries);
+
+    } catch (const std::exception& ex) {
+        std::cerr << "Error: " << ex.what() << '\n';
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
