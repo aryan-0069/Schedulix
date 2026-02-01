@@ -403,3 +403,147 @@ The allotment fix: track cumulative CPU time at the level. The above example bur
 
 ---
 
+## 9. Algorithm 6 — CFS (Completely Fair Scheduler)
+
+### Philosophy
+
+CFS (introduced in Linux 2.6.23, 2007) abandons fixed quanta entirely. Instead, it tracks a **virtual runtime** for each process and always schedules the process that is most "behind" in virtual time.
+
+The goal: every process gets an **equal share of CPU time** (adjusted by weight).
+
+### Virtual Runtime (vruntime)
+
+```
+vruntime_delta = actual_time × WEIGHT_NICE0 / weight_i
+```
+
+Where:
+- `WEIGHT_NICE0 = 1024` is the default weight at nice=0
+- `weight_i` is the weight of process i from the nice table
+- Heavier processes (lower nice, higher weight) accumulate vruntime **more slowly** → they run longer per unit of real time
+
+### Nice-to-Weight Table
+
+Linux uses a hand-tuned table where each step in nice value is a ~25% weight change:
+
+```
+nice  weight   ratio to nice-1
+-20   88761    ~1.25x
+-15   29154
+-10   9548
+-5    3121
+ 0    1024     (baseline)
++5    335
++10   110
++15   36
++19   15
+```
+
+This means a process with nice=-5 gets ~3× more CPU than nice=+5. The 25% ratio was chosen so the difference between adjacent levels is perceptible but not overwhelming.
+
+### The Runqueue
+
+In Linux CFS, the runqueue is a **red-black tree** (self-balancing BST) keyed by vruntime. The leftmost node (minimum vruntime) is always cached for O(1) next-process selection.
+
+In our implementation, we use `std::set<RQEntry>` which provides the same O(log n) insert/remove and O(1) min-element access.
+
+### Scheduling Period (target_latency)
+
+The **scheduling period** (target_latency) is the time over which every runnable process gets at least one slice. Linux uses:
+
+```
+sched_latency = max(6ms × number_of_processes, 48ms)
+```
+
+For our implementation: `CFS_TARGET_LATENCY = 20ms`.
+
+### Slice Calculation
+
+```
+slice_i = target_latency × weight_i / total_weight
+```
+
+This ensures processes with higher weight get proportionally larger slices.
+
+**Minimum granularity** (default 1ms in our impl, 0.75ms in Linux) prevents pathologically tiny slices with many processes.
+
+### Wakeup and Lag Compensation
+
+When a process sleeps (I/O wait) and then wakes up, its vruntime is far behind the current minimum (min_vruntime). A naïve implementation would give it unlimited CPU time to "catch up."
+
+Linux solves this with **lag compensation**:
+
+```
+vruntime_on_wakeup = max(vruntime_of_process,
+                         min_vruntime − target_latency)
+```
+
+This means a sleeping process wakes up to "one scheduling period behind" min_vruntime — it gets priority but not unlimited catchup.
+
+### min_vruntime
+
+`min_vruntime` is a monotonically increasing floor of all vruntimes in the runqueue. It:
+1. Sets the baseline for new/waking processes
+2. Prevents vruntime from wrapping (for long-running systems)
+
+```
+On each schedule tick:
+    min_vruntime = max(min_vruntime, leftmost_node.vruntime)
+```
+
+### CFS vs MLFQ comparison
+
+| Aspect | MLFQ | CFS |
+|---|---|---|
+| Priority model | Multi-level discrete | Continuous weight-based |
+| Time tracking | Quantum/allotment | Exact vruntime |
+| Starvation | Boost prevents it | min_vruntime lag prevents it |
+| Interactive responsiveness | High (stays at L0) | High (low vruntime on wakeup) |
+| Configurability | Many knobs (levels, boosts) | nice value only |
+| Gaming resistance | Allotment-based (fixed) | Mathematically ungameable |
+
+---
+
+## 10. Fairness Theory
+
+### What is "fair" scheduling?
+
+**Max-min fairness**: Maximize the minimum allocation; then among all allocations that achieve that minimum, maximize the second-minimum, and so on.
+
+**Proportional fairness**: Allocate CPU proportionally to weights. If process i has weight wᵢ and total weight W, process i should receive wᵢ/W fraction of CPU.
+
+### Jain's Fairness Index
+
+Defined by Rajendra Jain (1984):
+
+```
+J(x₁, x₂, ..., xₙ) = (Σxᵢ)² / (n · Σxᵢ²)
+```
+
+Where `xᵢ` is the "allocation" of resource to user i.
+
+Properties:
+- **Range**: 1/n ≤ J ≤ 1
+- **J = 1**: Perfect fairness (all allocations equal)
+- **J = 1/n**: Worst case (one user gets everything)
+- **Independence of scale**: Doubling all allocations doesn't change J
+- **Population monotonicity**: Adding another user with equal allocation keeps J ≥ old J
+
+In our implementation:
+```
+xᵢ = burst_i / turnaround_i
+```
+This measures what fraction of each task's lifetime was "useful" (on CPU). A perfectly fair scheduler where every task spends the same fraction of time on-CPU gives J=1.
+
+### Normalized Turnaround Time
+
+Another fairness measure:
+
+```
+NTT_i = TAT_i / BT_i
+```
+
+NTT = 1 means the process's turnaround equals its burst (no waiting — impossible in multi-process systems). A fair scheduler minimizes the maximum NTT.
+
+---
+
