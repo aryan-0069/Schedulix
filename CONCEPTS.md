@@ -547,3 +547,228 @@ NTT = 1 means the process's turnaround equals its burst (no waiting — impossib
 
 ---
 
+## 11. Real Process Control on Linux
+
+### Fork and Exec
+
+```c
+pid_t pid = fork();
+if (pid == 0) {
+    // Child process: exact copy of parent
+    exec(...)  // replace with new program, or just run work directly
+} else {
+    // Parent process: pid = child's PID
+}
+```
+
+In our project, children don't exec — they run the workload function directly.
+
+### SIGSTOP and SIGCONT
+
+| Signal | Effect |
+|---|---|
+| `SIGSTOP` | Forces process into stopped state; **cannot be caught, blocked, or ignored** |
+| `SIGCONT` | Resumes a stopped process; also cannot be blocked |
+| `SIGSTP` | Like SIGSTOP but can be caught (used by Ctrl+Z in terminals) |
+
+Our scheduler uses SIGSTOP/SIGCONT to simulate preemption:
+
+```
+1. Child forks and immediately raises(SIGSTOP) — parks itself
+2. Parent confirms stop via waitpid(WUNTRACED)
+3. Scheduler sends SIGCONT to grant CPU
+4. SIGALRM fires at quantum boundary → parent sends SIGSTOP
+5. Parent waits for confirmed stop → picks next task
+```
+
+**Critical**: Always confirm the stop before sending SIGCONT to the next process. Without this, two processes can run simultaneously.
+
+### waitpid Flags
+
+| Flag | Meaning |
+|---|---|
+| `WUNTRACED` | Also return if child has been stopped (not just exited) |
+| `WCONTINUED` | Also return if child has been resumed |
+| `WNOHANG` | Return immediately if no child has changed state |
+
+```c
+// Block until pid is confirmed stopped
+int status;
+waitpid(pid, &status, WUNTRACED);
+if (WIFSTOPPED(status)) { /* confirmed stopped */ }
+if (WIFEXITED(status))  { /* confirmed exited */ }
+```
+
+### CLOCK_PROCESS_CPUTIME_ID
+
+This clock type measures **CPU time consumed by the process** — it does NOT advance while the process is stopped. This is exactly what we want for measuring burst progress:
+
+```c
+struct timespec start, cur;
+clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
+// ... busy work ...
+clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cur);
+double cpu_ms = (cur.tv_sec - start.tv_sec) * 1000.0
+              + (cur.tv_nsec - start.tv_nsec) / 1e6;
+```
+
+If the process is SIGSTOP'd during this loop, the clock pauses. Resume with SIGCONT and the clock continues. The total measured CPU time is exactly the burst budget.
+
+### Process Groups and Signal Safety
+
+When a child forks, it inherits the parent's signal handlers. We must be careful:
+- Children should not receive SIGALRM meant for the parent
+- Use `setpgrp()` or `setsid()` to put children in their own process group for clean signal isolation
+
+In our implementation, we send SIGSTOP/SIGCONT to individual PIDs (not groups) to avoid this issue.
+
+---
+
+## 12. Timer Mechanisms
+
+### setitimer / SIGALRM (our approach)
+
+```c
+struct itimerval itv{};
+itv.it_value.tv_sec  = 0;
+itv.it_value.tv_usec = quantum_us;  // quantum in microseconds
+setitimer(ITIMER_REAL, &itv, nullptr);
+// SIGALRM fires after quantum_us microseconds
+```
+
+**Resolution**: ~1 ms on modern Linux (hardware timer tick granularity).
+
+**Limitation**: Only one SIGALRM timer per process. Cannot use it for multiple concurrent timers.
+
+**Why `ITIMER_REAL`?** It counts wall-clock time (not CPU time), so it fires even when the process is blocked. This is what we want — the parent needs to preempt the child after wall-clock time, not parent's CPU time.
+
+### timerfd (Linux alternative)
+
+`timerfd` provides a file-descriptor-based timer that can be read with `read()` or polled with `epoll()`:
+
+```c
+int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+struct itimerspec ts{};
+ts.it_value.tv_nsec = quantum_ns;
+timerfd_settime(tfd, 0, &ts, nullptr);
+// Block until timer fires:
+uint64_t exp; read(tfd, &exp, sizeof(exp));
+```
+
+Advantages:
+- Integrable with event loops (epoll/select)
+- Multiple timers possible (one fd per timer)
+- No signal-based asynchrony — cleaner programming model
+
+Our implementation uses `setitimer` for simplicity; `timerfd` would be preferable in a production system.
+
+### Signal delivery latency
+
+Even with a perfectly set timer, SIGALRM is delivered asynchronously. The kernel queues the signal and delivers it at the next scheduler opportunity. Typical delivery latency: 10–100 µs. This means our slices may overshoot by that amount — measurable in our validation reports.
+
+---
+
+## 13. The Simulation Engine
+
+### Event-driven simulation
+
+The simulator runs in **logical time** (ticks), not wall-clock time. It processes events in chronological order:
+
+```
+Events:
+- Process arrival (AT): process enters ready queue
+- Quantum expiry: currently running process is preempted
+- Process completion: process exits
+
+Event loop:
+  1. At current_time, admit all newly arrived processes
+  2. Pick the next process according to the algorithm's policy
+  3. Determine how long it can run: min(burst_remaining, next_event_time - current_time)
+  4. Record segment [current_time, current_time + run]
+  5. Advance current_time += run
+  6. Update state
+  7. Goto 1
+```
+
+### Why build a simulator?
+
+1. **Instant results**: O(n log n) vs real-time execution
+2. **Determinism**: No OS jitter; perfect repeatability
+3. **Validation baseline**: Compare against real backend to detect bugs
+4. **Exploration**: Test many configurations quickly
+
+### Simulator accuracy limitations
+
+- Ignores context-switch overhead (assumed zero)
+- Assumes process executes exactly `burst` ticks (no variance)
+- Treats time as discrete integers (rounding errors at boundaries)
+- Does not model I/O, memory pressure, cache effects
+
+---
+
+## 14. The Real Scheduler Backend
+
+### Architecture
+
+```
+Parent process (scheduler):
+  1. Fork n children, each immediately parks with raise(SIGSTOP)
+  2. Wait for all children to confirm stopped (waitpid WUNTRACED)
+  3. Run scheduling loop:
+     a. Select next process
+     b. Arm SIGALRM timer with slice duration
+     c. Send SIGCONT to chosen child
+     d. Poll: wait for SIGALRM or child exit
+     e. On SIGALRM: send SIGSTOP to child, wait for confirmation
+     f. Record [start_time, end_time] segment
+     g. Goto 3a
+```
+
+### Why poll instead of blocking wait?
+
+We need to detect two events: timer expiry (SIGALRM) and child exit. We can't use `waitpid()` without WNOHANG because it would block on exit but not see SIGALRM.
+
+Solution: poll with short sleep + check SIGALRM flag:
+
+```c
+volatile sig_atomic_t g_alarm_fired = 0;
+void sigalrm_handler(int) { g_alarm_fired = 1; }
+
+// Poll loop in parent:
+while (!g_alarm_fired) {
+    pid_t r = waitpid(child_pid, &status, WNOHANG | WUNTRACED);
+    if (r == child_pid && (WIFEXITED(status) || WIFSIGNALED(status))) {
+        exited = true; break;
+    }
+    nanosleep({0, 100000}, nullptr);  // 0.1ms sleep
+}
+```
+
+The 0.1ms polling interval adds at most 0.1ms measurement error — acceptable for bursts ≥ 50ms.
+
+### CPU time measurement per child
+
+The child uses `CLOCK_PROCESS_CPUTIME_ID` internally to count its own CPU time.  The parent cannot directly query this clock for another process (without reading `/proc/PID/stat`).
+
+In our design, the child is responsible for stopping itself when its burst is complete:
+
+```c
+// In child:
+clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
+while (elapsed_cpu_time < burst_ms) {
+    // busy work
+}
+_exit(0);
+```
+
+The parent sees the child exit and records the wall-clock completion time. The child's CPU clock ensures it always burns exactly `burst_ms` of CPU, regardless of how many times it was paused.
+
+### Signal Safety
+
+Rules for signal handlers:
+- Only async-signal-safe functions are allowed (write, _exit, but NOT malloc, printf)
+- We use volatile `sig_atomic_t` for flags shared between signal handler and main code
+- No mutexes inside signal handlers
+
+---
+
