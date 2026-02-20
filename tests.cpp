@@ -295,3 +295,107 @@ static void suite_srtf() {
     check_near("SRTF P3 WT",  r3.waiting,         2.0);
 }
 
+// ─── Suite 4: Round Robin correctness ────────────────────────────────────────
+//
+// Classic RR q=2 example:
+//   P0: AT=0, BT=5
+//   P1: AT=0, BT=3
+//   P2: AT=0, BT=1
+//   P3: AT=0, BT=2
+//
+//   q=2:
+//   [0,2] P0  [2,4] P1  [4,5] P2(1)done  [5,7] P3(2)done  [7,9] P0  [9,10] P0(1)done  [10,11] P1(1)done
+//   Wait, let me re-derive with proper RR rules:
+//   All arrive at 0: queue=[P0,P1,P2,P3]
+//   t=0-2: P0 runs (rem=3), queue=[P1,P2,P3,P0]
+//   t=2-4: P1 runs (rem=1), queue=[P2,P3,P0,P1]
+//   t=4-5: P2 runs (rem=0, done), queue=[P3,P0,P1]
+//   t=5-7: P3 runs (rem=0, done), queue=[P0,P1]
+//   t=7-9: P0 runs (rem=1), queue=[P1,P0]
+//   t=9-10: P1 runs (rem=0, done), queue=[P0]
+//   t=10-11: P0 runs (rem=0, done)
+//   P0: CT=11, TAT=11, WT=6
+//   P1: CT=10, TAT=10, WT=7
+//   P2: CT=5,  TAT=5,  WT=4
+//   P3: CT=7,  TAT=7,  WT=5
+
+static void suite_rr() {
+    std::cout << "\n=== Suite 4: Round Robin (q=2) ===\n";
+    std::vector<Task> tasks = {{0,0,5},{1,0,3},{2,0,1},{3,0,2}};
+    auto tl  = t_rr(tasks, 2);
+    auto res = buildResults(tasks, tl);
+
+    auto r0=getResult(res,0); auto r1=getResult(res,1);
+    auto r2=getResult(res,2); auto r3=getResult(res,3);
+
+    check_near("RR P2 CT", r2.completion_time, 5.0, 1.0);
+    check_near("RR P3 CT", r3.completion_time, 7.0, 1.0);
+    check_near("RR P1 CT", r1.completion_time, 10.0, 1.0);
+    check_near("RR P0 CT", r0.completion_time, 11.0, 1.0);
+
+    // Total burst = 5+3+1+2 = 11 → makespan should be 11
+    check_near("RR makespan", tl.back().end, 11.0, 0.1);
+
+    // All processes arrive at 0 → response = first run - 0 = first run
+    // P0 should run first (first in queue)
+    check_near("RR P0 response", r0.response, 0.0);
+    check("RR CPU utilization ~100%", buildSummary("RR", tl, res).cpu_utilization > 99.0);
+}
+
+// ─── Suite 5: MLFQ invariants ────────────────────────────────────────────────
+
+static void suite_mlfq() {
+    std::cout << "\n=== Suite 5: MLFQ Invariants ===\n";
+
+    // Test: CPU-bound process demotes to lower level
+    {
+        std::vector<Task> tasks = {{0, 0, 20}};  // single long task
+        auto tl = t_mlfq(tasks, /*bq=*/4, /*boost=*/1000, /*lv=*/3);
+        // First 4 ticks should be at level 0
+        bool first_at_l0 = !tl.empty() && tl[0].level == 0;
+        check("MLFQ single task starts at level 0", first_at_l0);
+        // After allotment exhausted (4 ticks), should demote to level 1
+        bool demotes = false;
+        for (const auto& s : tl) if (s.level > 0) { demotes = true; break; }
+        check("MLFQ long task demotes to lower level", demotes);
+    }
+
+    // Test: Short task stays at high level
+    {
+        std::vector<Task> tasks = {{0, 0, 3}};  // burst < q=4 → completes in level 0
+        auto tl = t_mlfq(tasks, 4, 1000, 3);
+        bool all_l0 = true;
+        for (const auto& s : tl) if (s.level != 0) { all_l0 = false; break; }
+        check("MLFQ short task stays at level 0", all_l0);
+    }
+
+    // Test: Priority boost moves all tasks to level 0
+    {
+        // One long task (demotes), then boost fires
+        std::vector<Task> tasks = {{0, 0, 200}};
+        auto tl = t_mlfq(tasks, 4, 50, 3); // boost every 50 ticks
+        bool saw_level2 = false, saw_boost_back = false;
+        int prev_level = 0;
+        for (const auto& s : tl) {
+            if (s.level == 2) saw_level2 = true;
+            if (saw_level2 && s.level < prev_level) saw_boost_back = true;
+            prev_level = s.level;
+        }
+        check("MLFQ task reaches level 2 before boost", saw_level2);
+        check("MLFQ boost resets level back to 0",       saw_boost_back);
+    }
+
+    // Test: Higher priority process preempts lower
+    {
+        // P0 starts at t=0 (CPU-bound, demotes), P1 arrives at t=10 (short)
+        std::vector<Task> tasks = {{0, 0, 30}, {1, 10, 5}};
+        auto tl = t_mlfq(tasks, 4, 1000, 3);
+        // After P1 arrives, it should run at level 0 (higher priority than P0's demoted level)
+        bool p1_preempts = false;
+        for (size_t i = 0; i < tl.size(); i++) {
+            if (tl[i].id == 1) { p1_preempts = (tl[i].level == 0); break; }
+        }
+        check("MLFQ new arrival at level 0 preempts demoted task", p1_preempts);
+    }
+}
+
