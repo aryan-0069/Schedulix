@@ -772,3 +772,404 @@ Rules for signal handlers:
 
 ---
 
+## 15. Validation Methodology
+
+### What we're testing
+
+The simulator is a **model**. The real backend is **reality**. Validation measures how accurate the model is.
+
+### Matching workloads
+
+Both simulator and real backend receive identical:
+- Process arrival times
+- Burst sizes (ticks = ms)
+- Nice values
+- Scheduling algorithm
+- Quantum
+
+### Metrics compared
+
+For each algorithm, we compute:
+
+```
+absolute_error(metric) = |simulated_value - real_value|
+percent_error(metric)  = |simulated_value - real_value| / simulated_value × 100%
+```
+
+### Expected error ranges
+
+| Burst size | Expected TAT error | Cause |
+|---|---|---|
+| 10 ms | 20-50% | Signal latency dominates |
+| 50 ms | 5-15% | Acceptable for demonstrations |
+| 200 ms | 1-5% | Good match |
+| 1000 ms | < 1% | Excellent match |
+
+### Sources of error
+
+1. **Signal delivery latency**: SIGALRM arrives ~10-100µs late → slice overshoots
+2. **SIGSTOP/SIGCONT overhead**: Each preemption costs ~50µs for signal + kernel state save/restore
+3. **OS scheduling jitter**: The kernel's own scheduler decides when the parent runs after SIGALRM
+4. **Timer resolution**: setitimer has ~1ms resolution; short quanta have higher relative error
+5. **Fork overhead**: First slice slightly longer due to process initialization
+
+### Validation report interpretation
+
+```
+Avg TAT error < 5%  → simulator is a good predictor
+Avg TAT error 5-15% → acceptable with noted limitations
+Avg TAT error > 15% → investigate — likely a bug or wrong burst size
+Context switch delta = 0 → algorithm implemented correctly
+Jain's J error < 0.05 → fairness model accurate
+```
+
+---
+
+## 16. Data Structures Deep Dive
+
+### Task (input)
+
+```cpp
+struct Task {
+    int id;        // 0-based index
+    int arrival;   // when process enters ready queue
+    int burst;     // total CPU work needed
+    int nice;      // [-20, 19]; maps to weight via niceToWeight()
+    int priority;  // for MLFQ static initial placement
+};
+```
+
+### Segment (timeline unit)
+
+```cpp
+struct Segment {
+    int    id;      // which process
+    double start;   // inclusive (supports fractional ms in real backend)
+    double end;     // exclusive
+    int    level;   // MLFQ level (0 = highest)
+};
+```
+
+The complete `vector<Segment>` is the **ground truth** from which all metrics are derived. This is the same structure regardless of algorithm or backend.
+
+### TaskResult (derived metrics)
+
+Computed by `buildResults(tasks, timeline)`:
+```cpp
+struct TaskResult {
+    int    id;
+    double start_time;
+    double completion_time;
+    double turnaround;
+    double waiting;
+    double response;
+    int    context_switches;
+};
+```
+
+### RunSummary (aggregate)
+
+```cpp
+struct RunSummary {
+    std::string name;
+    double avg_turnaround;
+    double avg_waiting;
+    double avg_response;
+    double cpu_utilization;
+    int    context_switches;
+    double jains_fairness;
+    double makespan;
+};
+```
+
+### Priority Queue for SJF/SRTF
+
+```cpp
+// Min-heap by (burst, arrival, id) for SJF
+using T3 = std::tuple<int,int,int>;
+std::priority_queue<T3, std::vector<T3>, std::greater<T3>> rq;
+// Push: rq.push({burst, arrival, id})
+// Pop:  auto [bt, at, id] = rq.top(); rq.pop();
+```
+
+The 3-tuple tie-breaking ensures deterministic behavior when multiple processes have equal burst times.
+
+### std::set for CFS runqueue
+
+```cpp
+struct RQEntry {
+    double vruntime;
+    int    id;
+    bool operator<(const RQEntry& o) const {
+        if (vruntime != o.vruntime) return vruntime < o.vruntime;
+        return id < o.id;  // stable tie-breaking
+    }
+};
+std::set<RQEntry> rq;
+// Min vruntime: rq.begin()   O(1) — set maintains order
+// Insert:       rq.insert()  O(log n)
+// Remove:       rq.erase()   O(log n)
+```
+
+This mirrors the Linux kernel's red-black tree runqueue.
+
+### MLFQ queue array
+
+```cpp
+std::vector<std::deque<int>> queues(num_levels);
+// queues[0] = highest priority deque of process indices
+// queues[k] = lowest priority
+```
+
+Each deque supports O(1) front access and O(1) push_front/push_back for reinsertion.
+
+---
+
+## 17. Worked Examples
+
+### FCFS Example (verified)
+
+```
+Input:
+  P0: AT=0, BT=4
+  P1: AT=1, BT=3
+  P2: AT=2, BT=5
+
+Execution:
+  t=0: P0 arrives, is alone → P0 starts
+  t=4: P0 finishes. P1 (arrived t=1), P2 (arrived t=2) both ready.
+       FCFS: pick P1 (arrived first among waiting)
+  t=7: P1 finishes. P2 ready.
+  t=12: P2 finishes.
+
+Results:
+  P0: ST=0, CT=4,  TAT=4-0=4,  WT=4-4=0
+  P1: ST=4, CT=7,  TAT=7-1=6,  WT=6-3=3
+  P2: ST=7, CT=12, TAT=12-2=10, WT=10-5=5
+
+  Avg TAT = (4+6+10)/3 = 6.67
+  Avg WT  = (0+3+5)/3  = 2.67
+
+Gantt: +--------+------+----------+
+       |   P0   |  P1  |    P2    |
+       +--------+------+----------+
+       0        4      7          12
+```
+
+### SRTF Example (verified)
+
+```
+Input:
+  P0: AT=0, BT=8
+  P1: AT=1, BT=4
+  P2: AT=2, BT=9
+  P3: AT=3, BT=5
+
+Step-by-step:
+  t=0: Only P0 ready (rem=8). P0 runs.
+  t=1: P1 arrives (rem=4). rem(P0)=7 > rem(P1)=4. Preempt P0!
+       P1 runs.
+  t=2: P2 arrives (rem=9). rem(P2)=9 > rem(P1)=3. P1 continues.
+  t=3: P3 arrives (rem=5). rem(P3)=5 > rem(P1)=2. P1 continues.
+  t=5: P1 finishes (rem=0). Ready: P0(7), P2(9), P3(5).
+       Pick P3 (rem=5, smallest).
+  t=10: P3 finishes. Ready: P0(7), P2(9). Pick P0.
+  t=17: P0 finishes. Only P2 (rem=9). P2 runs.
+  t=26: P2 finishes.
+
+Results:
+  P0: ST=0,  CT=17, TAT=17, WT=17-8=9
+  P1: ST=1,  CT=5,  TAT=4,  WT=4-4=0
+  P2: ST=17, CT=26, TAT=24, WT=24-9=15
+  P3: ST=5,  CT=10, TAT=7,  WT=7-5=2
+
+  Avg TAT = (17+4+24+7)/4 = 13.0
+  Avg WT  = (9+0+15+2)/4  = 6.5
+
+Gantt: +--+--------+----------+--------------+------------------+
+       |P0|   P1   |    P3    |      P0      |        P2        |
+       +--+--------+----------+--------------+------------------+
+       0  1        5          10             17                 26
+```
+
+### Round Robin Example (q=2, verified)
+
+```
+Input: P0(BT=5), P1(BT=3), P2(BT=1), P3(BT=2), all AT=0
+
+Initial queue: [P0, P1, P2, P3]
+
+t=0:  Run P0 [0,2], rem=3. Admit none. Queue: [P1, P2, P3, P0]
+t=2:  Run P1 [2,4], rem=1. Queue: [P2, P3, P0, P1]
+t=4:  Run P2 [4,5], rem=0. P2 done! Queue: [P3, P0, P1]
+t=5:  Run P3 [5,7], rem=0. P3 done! Queue: [P0, P1]
+t=7:  Run P0 [7,9], rem=1. Queue: [P1, P0]
+t=9:  Run P1 [9,10], rem=0. P1 done! Queue: [P0]
+t=10: Run P0 [10,11], rem=0. P0 done!
+
+Results:
+  P0: ST=0,  CT=11, TAT=11, WT=6
+  P1: ST=2,  CT=10, TAT=10, WT=7
+  P2: ST=4,  CT=5,  TAT=5,  WT=4
+  P3: ST=5,  CT=7,  TAT=7,  WT=5
+
+  Avg TAT = (11+10+5+7)/4 = 8.25
+  Avg WT  = (6+7+4+5)/4   = 5.5
+
+Context switches: P0→P1→P2→P3→P0→P1→P0 = 6 switches
+```
+
+### CFS vruntime trace (2 processes, equal weight)
+
+```
+P0: AT=0, BT=10, weight=1024 (nice=0)
+P1: AT=0, BT=10, weight=1024 (nice=0)
+target_latency=10, min_gran=1
+
+Initial: P0.vrt=0, P1.vrt=0, total_weight=2048
+Slice = (10 × 1024) / 2048 = 5
+
+t=0:  Pick P0 (vrt=0, tied — break by id). Run [0,5].
+      P0.vrt += 5 × 1024/1024 = 5.  P0.vrt=5.
+t=5:  Pick P1 (vrt=0 < P0.vrt=5). Run [5,10].
+      P1.vrt += 5. P1.vrt=5.
+t=10: Pick P0 (tied again). Run [10,15]. P0.vrt=10.
+t=15: Pick P1. Run [15,20]. P1.vrt=10.
+... and so on, perfectly alternating.
+
+Result: Both complete at t=20.
+P0: TAT=20, WT=10. P1: TAT=20, WT=10.
+Jain's J = 1.0 (perfect fairness)
+```
+
+---
+
+## 18. Performance Analysis & Trade-offs
+
+### Time Complexity
+
+| Algorithm | Time | Space |
+|---|---|---|
+| FCFS | O(n log n) | O(n) |
+| SJF | O(n log n) | O(n) |
+| SRTF | O(n log n) | O(n) — up to O(n²) segments |
+| Round Robin | O(n log n + S) — S=segments | O(n) |
+| MLFQ | O(S log n) — S=segments | O(n) |
+| CFS | O(S log n) — S=segments | O(n) |
+
+### Average Metrics Comparison (typical workloads)
+
+| Algorithm | Avg TAT | Avg WT | Avg RT | Fairness | Ctx Sw |
+|---|---|---|---|---|---|
+| FCFS | High | High | Low | Poor | Minimal |
+| SJF | Low | Low | Moderate | Medium | Minimal |
+| SRTF | Lowest | Lowest | Moderate | Medium | High |
+| RR | Medium | Medium | Best | Good | High |
+| MLFQ | Low-Medium | Low-Medium | Best | Good | Medium |
+| CFS | Medium | Medium | Good | Best | Medium |
+
+### The Exploitation vs Exploration Trade-off
+
+- **SRTF** exploits known burst times to be optimal — but these are rarely known
+- **MLFQ** explores (treats new processes as short, learns from behavior)
+- **CFS** explores through continuous vruntime adjustment
+
+### Cache Efficiency
+
+Real schedulers also consider cache locality. A process that was recently running may have hot cache lines. Re-scheduling it quickly after preemption is cache-friendly. This is why Linux CFS has the **buddy system** — after a wakeup, it may preempt the current task in favor of its "buddy" (the task that just woke it).
+
+---
+
+## 19. Common Pitfalls & How We Solve Them
+
+### Pitfall 1: Double output after fork()
+
+**Problem**: After `fork()`, both parent and child have buffered stdio data. If the parent calls `printf()` before forking, both will flush those buffers on exit — double output.
+
+**Solution**: Children use `_exit(0)` not `exit(0)`. `_exit` immediately terminates without flushing stdio buffers.
+
+### Pitfall 2: SIGCONT before confirming SIGSTOP
+
+**Problem**: After sending SIGSTOP to a child, there's a window where the child is still running (SIGSTOP is delivered asynchronously). If the parent immediately sends SIGCONT to the next child, two children run simultaneously.
+
+**Solution**: Always call `waitpid(pid, &status, WUNTRACED)` and check `WIFSTOPPED(status)` before considering a child stopped.
+
+### Pitfall 3: SIGALRM race with child exit
+
+**Problem**: The child might exit exactly as SIGALRM fires. The parent then tries to send SIGSTOP to an already-exited process.
+
+**Solution**: `kill()` with a dead PID returns `ESRCH` (no such process). We check for `ESRCH` and handle it gracefully in `xkill()`.
+
+### Pitfall 4: SRTF wrong segment split
+
+**Problem**: When a new process arrives and preempts the current process, the segment must be split at the arrival time, not at the preemption response time.
+
+**Solution**: `run = min(remaining, next_arrival - current_time)`. This ensures the segment ends exactly when the new process arrives.
+
+### Pitfall 5: RR admission order
+
+**Problem**: Admitting new processes after re-queuing the preempted process gives wrong results (new process goes behind preempted one when it should go in front in some implementations).
+
+**Solution**: Admit new arrivals before deciding whether to re-queue the preempted process. Our implementation admits during the slice, then re-queues.
+
+### Pitfall 6: CFS vruntime precision
+
+**Problem**: Floating-point accumulation errors in vruntime after thousands of iterations can cause incorrect scheduling order.
+
+**Solution**: Use `double` (64-bit) for vruntime. The error is ~1 part in 10¹⁵ — negligible for practical burst counts.
+
+### Pitfall 7: min_vruntime not monotonic
+
+**Problem**: If we set `min_vruntime = rq.begin()->vruntime` and the runqueue is temporarily empty, then fill with a new arrival at vruntime=0, min_vruntime goes backwards.
+
+**Solution**: `min_vruntime = max(min_vruntime, computed_value)` — it only moves forward.
+
+---
+
+## 20. Interview Questions & Answers
+
+**Q: What is the difference between preemptive and non-preemptive scheduling?**
+
+A: In non-preemptive scheduling (FCFS, SJF), once a process gets the CPU it keeps it until it voluntarily yields (I/O, exit). In preemptive scheduling (SRTF, RR, MLFQ, CFS), the OS can forcibly remove a running process via a timer interrupt. Preemptive scheduling improves response time for interactive processes but incurs context-switch overhead.
+
+**Q: Why is SRTF optimal for average waiting time?**
+
+A: Greedy argument: at any moment, running the process with the shortest remaining time minimizes the waiting time accumulated by other processes in the ready queue. If we ran a longer process instead, shorter processes would wait unnecessarily. By induction over scheduling decisions, SRTF minimizes total (and hence average) waiting time.
+
+**Q: What is the convoy effect in FCFS?**
+
+A: One long CPU-bound process can monopolize the CPU, causing all shorter processes behind it to wait — like a convoy behind a slow truck. With FCFS, average waiting time can be very high if short processes arrive after a long one.
+
+**Q: How does MLFQ prevent starvation?**
+
+A: Through periodic priority boosts (Rule 5). Every S ticks, all processes are moved to the top queue (Level 0). Even a CPU-bound process that has been repeatedly demoted to the lowest level gets periodic access to the CPU.
+
+**Q: What is vruntime in CFS?**
+
+A: Virtual runtime is the total CPU time a process has used, weighted by its priority. Specifically: `vruntime_delta = real_time × WEIGHT_NICE0 / weight_i`. Heavier processes (lower nice) accumulate vruntime more slowly, so they run longer per scheduling period. CFS always schedules the process with the smallest vruntime, ensuring proportional CPU share.
+
+**Q: How does the quantum size affect Round Robin performance?**
+
+A: A very small quantum improves response time (every process gets CPU very quickly) but increases overhead because of frequent context switches. A very large quantum degenerates to FCFS (each process runs to completion). The optimal quantum is slightly larger than the typical CPU burst for interactive processes.
+
+**Q: Why use CLOCK_PROCESS_CPUTIME_ID instead of CLOCK_MONOTONIC for child burst measurement?**
+
+A: CLOCK_MONOTONIC measures wall-clock time and keeps advancing even when the process is stopped (via SIGSTOP). CLOCK_PROCESS_CPUTIME_ID only advances while the process is actually scheduled. This is essential for correct burst measurement — a SIGSTOP'd process should not "use up" its burst budget while waiting.
+
+**Q: What is Jain's Fairness Index and what does a value of 0.5 mean?**
+
+A: Jain's Fairness Index J = (Σxᵢ)² / (n·Σxᵢ²) where xᵢ is each user's normalized allocation. J=1.0 means perfect fairness; J=1/n is the worst case. J=0.5 for 2 users means one user is getting most of the resource (equivalent to 1/(n·J) = 1 user getting everything, interpolated).
+
+**Q: How would you improve the real scheduler's accuracy?**
+
+A: Several approaches:
+1. Use timerfd instead of SIGALRM for lower-jitter timer delivery
+2. Use `CPU_SET` + `sched_setaffinity` to pin parent and children to the same core (no migration jitter)
+3. Use `SCHED_FIFO` for the parent process to get real-time priority
+4. Use `nanosleep` with remaining-time re-check to account for early wakeup from signals
+5. Increase burst sizes to reduce relative measurement error
+6. Average multiple runs to smooth OS jitter
+
+**Q: What is the difference between throughput and turnaround time optimization?**
+
+A: Throughput = processes/time_unit — maximize by keeping the CPU busy (high utilization, batch workloads). Turnaround time = time from arrival to completion for individual processes — minimize by running processes quickly. These can conflict: a scheduler that favors short jobs (like SJF) reduces average TAT but may starve long jobs, reducing their individual throughput. CFS balances both by giving everyone a proportional share.
