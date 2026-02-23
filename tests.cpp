@@ -399,3 +399,198 @@ static void suite_mlfq() {
     }
 }
 
+// ─── Suite 6: CFS fairness ────────────────────────────────────────────────────
+
+static std::vector<Segment> t_cfs(const std::vector<Task>& tasks,
+                                   double tl_ms = 20.0, double mg = 1.0) {
+    if (tasks.empty()) return {};
+    struct RQE {
+        double vrt;
+        int    pi;
+        bool operator<(const RQE& o) const {
+            return vrt != o.vrt ? vrt < o.vrt : pi < o.pi;
+        }
+    };
+    struct TS { int rem, w; double vrt; };
+    const int n = static_cast<int>(tasks.size());
+    std::vector<Task> st = tasks;
+    std::sort(st.begin(), st.end(), [](const Task& a, const Task& b){
+        return a.arrival < b.arrival || (a.arrival == b.arrival && a.id < b.id);
+    });
+    std::vector<TS> ts(n);
+    for (int i = 0; i < n; i++) ts[i] = {st[i].burst, st[i].weight(), 0.0};
+    std::set<RQE> rq;
+    double mvrt = 0, cur = st[0].arrival;
+    int idx = 0;
+    auto tw = [&]{
+        int s = 0;
+        for (const auto& e : rq) s += ts[e.pi].w;
+        return s == 0 ? 1 : s;
+    };
+    auto admit = [&](double t){
+        while (idx < n && st[idx].arrival <= t) {
+            double v = std::max(0.0, mvrt - tl_ms);
+            ts[idx].vrt = v;
+            rq.insert({v, idx});
+            idx++;
+        }
+    };
+    admit(cur);
+    std::vector<Segment> tl;
+    while (true) {
+        if (rq.empty()) {
+            if (idx < n) { cur = st[idx].arrival; admit(cur); continue; }
+            break;
+        }
+        auto it = rq.begin();
+        int pi = it->pi;
+        int tot_w = tw(); // runnable total weight includes pi
+        rq.erase(it);
+
+        double s = (tl_ms * ts[pi].w) / tot_w;
+        if (s < mg) s = mg;
+        double na = (idx < n) ? static_cast<double>(st[idx].arrival) : static_cast<double>(INF_TIME);
+        double act = std::min(s, static_cast<double>(ts[pi].rem));
+        if (na < cur + act) act = na - cur;
+        if (act <= 0) {
+            admit(cur);
+            rq.insert({ts[pi].vrt, pi});
+            continue;
+        }
+        tl.push_back({st[pi].id, cur, cur + act});
+        ts[pi].vrt += (act * WEIGHT_NICE0) / ts[pi].w;
+        ts[pi].rem -= static_cast<int>(act);
+        cur += act;
+        if (!rq.empty()) {
+            mvrt = std::max(mvrt, rq.begin()->vrt);
+        }
+        mvrt = std::max(mvrt, ts[pi].vrt - tl_ms);
+        admit(cur);
+        if (ts[pi].rem > 0) {
+            rq.insert({ts[pi].vrt, pi});
+        }
+    }
+    return tl;
+}
+
+static void suite_cfs() {
+    std::cout << "\n=== Suite 6: CFS Fairness ===\n";
+
+    // Test: Equal-weight tasks get equal CPU shares
+    {
+        std::vector<Task> tasks = {{0,0,100},{1,0,100},{2,0,100}};
+        auto tl = t_cfs(tasks);
+        auto res = buildResults(tasks, tl);
+        auto s = buildSummary("CFS", tl, res);
+        check("CFS equal tasks: Jain's J >= 0.95", s.jains_fairness >= 0.95);
+
+        // All three should complete at roughly the same time (within 25 ticks)
+        double ct0 = getResult(res,0).completion_time;
+        double ct1 = getResult(res,1).completion_time;
+        double ct2 = getResult(res,2).completion_time;
+        check_near("CFS equal tasks: P0 and P1 finish close", ct0, ct1, 25.0);
+        check_near("CFS equal tasks: P1 and P2 finish close", ct1, ct2, 25.0);
+    }
+
+    // Test: Higher-weight task gets proportionally more CPU while competing
+    {
+        // nice=-10 → weight=9548, nice=0 → weight=1024 (ratio ~9.3x)
+        std::vector<Task> tasks = {{0,0,100,/*nice=*/-10},{1,0,100,/*nice=*/0}};
+        auto tl = t_cfs(tasks);
+        auto res = buildResults(tasks, tl);
+
+        double ct0 = getResult(res, 0).completion_time;
+        double ct1 = getResult(res, 1).completion_time;
+        check("CFS high-weight task finishes before low-weight", ct0 < ct1);
+
+        // While task 0 was active (competing), count CPU time received by each
+        double cpu0_competing = 0, cpu1_competing = 0;
+        for (const auto& seg : tl) {
+            if (seg.start < ct0) {
+                double run_part = std::min(seg.end, ct0) - seg.start;
+                if (seg.id == 0) cpu0_competing += run_part;
+                else             cpu1_competing += run_part;
+            }
+        }
+        check("CFS high-weight task gets more CPU than low-weight while competing", cpu0_competing > cpu1_competing);
+        check("CFS weight ratio reflected in CPU allocation", cpu0_competing / cpu1_competing >= 2.0);
+    }
+
+    // Test: Jain's index is 1.0 for single task
+    {
+        std::vector<Task> tasks = {{0,0,50}};
+        auto tl = t_cfs(tasks);
+        auto res = buildResults(tasks, tl);
+        check_near("CFS single task Jain's J", jainsFairnessIndex(res), 1.0, 0.01);
+    }
+}
+
+// ─── Suite 7: Jain's Fairness Index ──────────────────────────────────────────
+
+static void suite_jains() {
+    std::cout << "\n=== Suite 7: Jain's Fairness Index ===\n";
+
+    // Perfect fairness: all tasks same burst and turnaround fraction → J=1
+    {
+        std::vector<TaskResult> res = {
+            {0,0,10,0,10,10,0,0,0},
+            {1,0,10,0,10,10,0,0,0},
+        };
+        check_near("Jain's J = 1.0 for equal throughput", jainsFairnessIndex(res), 1.0, 0.01);
+    }
+
+    // Worst case: only one task gets CPU → J ≈ 1/n
+    {
+        std::vector<TaskResult> res = {
+            {0,0,10,0,10,  10, 0,   0,0},  // burst/TAT = 1.0
+            {1,0,10,0,1000,1000,990,0,0},  // burst/TAT = 0.01
+        };
+        double j = jainsFairnessIndex(res);
+        check("Jain's J < 0.6 for very unfair schedule", j < 0.6);
+    }
+
+    // 3 equal tasks → J = 1
+    {
+        std::vector<TaskResult> res;
+        for (int i = 0; i < 3; i++)
+            res.push_back({i,0,10,0,10,10,0,0,0});
+        check_near("Jain's J = 1.0 for 3 equal tasks", jainsFairnessIndex(res), 1.0, 0.01);
+    }
+}
+
+// ─── Suite 8: niceToWeight ────────────────────────────────────────────────────
+
+static void suite_nice() {
+    std::cout << "\n=== Suite 8: niceToWeight ===\n";
+    check("niceToWeight(0)=1024",  niceToWeight(0)  == 1024);
+    check("niceToWeight(-20)=88761", niceToWeight(-20) == 88761);
+    check("niceToWeight(19)=15",   niceToWeight(19) == 15);
+    // Boundary clamping
+    check("niceToWeight(-25) clamped to -20", niceToWeight(-25) == niceToWeight(-20));
+    check("niceToWeight(25)  clamped to 19",  niceToWeight(25)  == niceToWeight(19));
+    // Monotonically decreasing: higher nice → lower weight
+    check("nice=-5 > nice=0 weight", niceToWeight(-5) > niceToWeight(0));
+    check("nice=5  < nice=0 weight", niceToWeight(5)  < niceToWeight(0));
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
+
+int main() {
+    std::cout << "╔══════════════════════════════════════════════════╗\n";
+    std::cout << "║   OS Scheduler — Unit & Integration Tests        ║\n";
+    std::cout << "╚══════════════════════════════════════════════════╝\n";
+
+    suite_fcfs();
+    suite_sjf();
+    suite_srtf();
+    suite_rr();
+    suite_mlfq();
+    suite_cfs();
+    suite_jains();
+    suite_nice();
+
+    std::cout << "\n" << std::string(50, '=') << '\n';
+    std::cout << "Results: " << g_pass << " passed, " << g_fail << " failed\n";
+    std::cout << std::string(50, '=') << '\n';
+    return g_fail > 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+}
